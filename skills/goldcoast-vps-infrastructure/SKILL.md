@@ -5,27 +5,107 @@ description: Troubleshoot Gold Coast AI Automations VPS infrastructure including
 
 # Gold Coast VPS Infrastructure Skill
 
-## Overview
-This skill documents the complete Docker infrastructure for Gold Coast AI Automations on Hostinger VPS (srv1175204.hstgr.cloud). Use this when troubleshooting MCP connections, network issues, or container communication failures.
+## Tech Stack
+
+### Infrastructure
+| Component | Version | Purpose |
+|-----------|---------|---------|
+| Ubuntu | 24.04.3 LTS | Host OS |
+| Docker | 29.1.5 | Container runtime |
+| Traefik | 3.6.2 | Reverse proxy, SSL |
+
+### MCP Stack
+| Component | Version | Purpose |
+|-----------|---------|---------|
+| FastMCP | 2.14.4 | MCP server framework |
+| Uvicorn | 0.40.0 | ASGI server |
+| SSE Transport | - | Claude connection |
+
+### Python Stack
+| Package | Version | Purpose |
+|---------|---------|---------|
+| Python | 3.12.3 | Runtime |
+| Flask | 3.x | REST APIs |
+| SeleniumBase | 4.46.0 | Stealth scraping |
+| Selenium | 4.40.0 | Browser automation |
+| OpenAI SDK | 2.15.0 | Embeddings, GPT |
+| Qdrant Client | 1.16.2 | Vector DB client |
+| HTTPX | 0.28.1 | Async HTTP |
+
+### Databases
+| Database | Version | Purpose |
+|----------|---------|---------|
+| Qdrant | 1.16.3 | Vector DB (embeddings) |
+| PostgreSQL | 15, 16 | Relational (Cal.com, Twenty) |
+| Redis | 7-alpine | Caching (Twenty) |
+
+### Automation & Workflow
+| Tool | Version | Purpose |
+|------|---------|---------|
+| N8N | 1.122.4 | Workflow automation |
+| Apify | Cloud | Scraping orchestration |
+| Instantly.ai | Cloud | Cold email |
+
+### AI/LLM Services
+| Service | Purpose |
+|---------|---------|
+| OpenAI | GPT-4o, embeddings |
+| Anthropic Claude | AI assistance |
+| Groq | Fast inference (Llama 3.3) |
+| Google Gemini | Alternative LLM |
+| ElevenLabs | Voice synthesis |
+| AssemblyAI | Transcription |
+
+### Business Tools
+| Tool | Purpose |
+|------|---------|
+| Cal.com | Scheduling |
+| Twenty CRM | Customer management |
+| Botpress v12 | Chatbots |
+| Code Server | Web IDE |
+
+### External APIs
+| API | Purpose |
+|-----|---------|
+| Keepa | Amazon price tracking |
+| GoDaddy | Domain availability |
+| Cloudinary | Image CDN |
+| Meta WhatsApp | Messaging |
 
 ## Network Architecture
 
 ### Docker Networks
-| Network | ID | Purpose |
-|---------|-----|---------|
-| `bridge` | 8661b5ddd64d | Default Docker network - **Qdrant, MCPs, Webtop** |
-| `root_default` | 340aeabe09b1 | Docker Compose network - **N8N, Traefik, Cal.com** |
+| Network | Purpose |
+|---------|---------|
+| `bridge` | Qdrant, MCPs, Webtop |
+| `root_default` | N8N, Traefik, Cal.com |
 
-### Container IPs (as of Jan 2026)
-| Container | Bridge IP | root_default IP | Port |
-|-----------|-----------|-----------------|------|
-| qdrant | 172.17.0.2 | - | 6333 |
-| botpress-mcp | 172.17.0.3 | - | 8080→8000 |
-| knowledge-mcp | 172.17.0.4 | - | 8082→8000 |
-| webtop | 172.17.0.5 | 172.18.0.12 | 5000 (API) |
-| root-n8n-1 | - | 172.18.0.6 | 5678 |
+### Container IPs (verify on restart)
+| Container | Bridge IP | Port |
+|-----------|-----------|------|
+| qdrant | 172.17.0.2 | 6333 |
+| botpress-mcp | 172.17.0.3 | 8080→8000 |
+| knowledge-mcp | 172.17.0.4 | 8082→8000 |
+| webtop | 172.17.0.5 | 5000 |
+| root-n8n-1 | 172.18.0.6 | 5678 |
 
-**CRITICAL:** IPs may change on container restart! Always verify with:
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    BRIDGE NETWORK                            │
+│  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────────────┐ │
+│  │ Qdrant  │  │knowledge│  │botpress │  │     Webtop      │ │
+│  │ :6333   │  │  -mcp   │  │  -mcp   │  │ (Chrome, Python)│ │
+│  └─────────┘  └─────────┘  └─────────┘  └─────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                   ROOT_DEFAULT NETWORK                       │
+│  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────────────┐ │
+│  │ Traefik │  │   N8N   │  │ Cal.com │  │   Twenty CRM    │ │
+│  └─────────┘  └─────────┘  └─────────┘  └─────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**CRITICAL:** IPs change on restart! Verify with:
 ```bash
 docker inspect <container> --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}'
 ```
@@ -34,8 +114,8 @@ docker inspect <container> --format '{{range .NetworkSettings.Networks}}{{.IPAdd
 
 ### Required Environment Variables
 ```bash
-OPENAI_API_KEY       # For embeddings (from /root/.goldcoast_credentials)
-QDRANT_HOST          # Qdrant IP on bridge network
+OPENAI_API_KEY       # For embeddings
+QDRANT_HOST          # Qdrant IP
 QDRANT_PORT          # 6333
 WEBTOP_API_URL       # http://<webtop-ip>:5000
 ```
@@ -66,98 +146,66 @@ docker exec knowledge-mcp sh -c "curl -fsSL https://download.docker.com/linux/st
 
 ## Common Issues & Fixes
 
-### Issue 1: "Name or service not known" / Can't resolve hostnames
-**Cause:** Containers on different networks can't resolve each other by name.
-**Fix:** Use IP addresses instead of hostnames, ensure all containers on `bridge` network.
+| Issue | Cause | Fix |
+|-------|-------|-----|
+| "Name or service not known" | Wrong network | Use IPs, not hostnames |
+| "Connection refused" | Container unreachable | Check IPs, recreate MCP |
+| "OpenAI not configured" | Missing env var | Add OPENAI_API_KEY |
+| Docker commands fail | No CLI | Install Docker CLI |
+| Claude can't connect | Stale SSE | Refresh browser |
 
-### Issue 2: "[Errno 111] Connection refused" from knowledge-mcp
-**Cause:** Qdrant or Webtop not reachable.
-**Diagnostic:**
+## Quick Diagnostic
 ```bash
-docker exec knowledge-mcp curl -s http://172.17.0.2:6333/collections
-docker exec knowledge-mcp curl -s http://172.17.0.5:5000/status
-```
-
-### Issue 3: "OpenAI not configured" error
-**Cause:** OPENAI_API_KEY not set in container.
-**Fix:** Recreate container with OPENAI_API_KEY from credentials file.
-
-### Issue 4: Docker commands fail inside knowledge-mcp
-**Fix:** Install Docker CLI (see Post-Creation above)
-
-### Issue 5: Claude.ai can't connect to MCP after container restart
-**Fix:** Refresh the browser page to reconnect Claude to MCP.
-
-## Quick Diagnostic Commands
-```bash
-# Check all container IPs
-for c in qdrant webtop knowledge-mcp botpress-mcp root-n8n-1; do
+# Check IPs
+for c in qdrant webtop knowledge-mcp botpress-mcp; do
   echo -n "$c: "
   docker inspect $c --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' 2>/dev/null || echo "not running"
 done
 
-# Test knowledge-mcp connectivity
-docker exec knowledge-mcp curl -s http://172.17.0.5:5000/status
+# Test connectivity
 docker exec knowledge-mcp curl -s http://172.17.0.2:6333/collections
+docker exec knowledge-mcp curl -s http://172.17.0.5:5000/status
 
-# Check MCP logs
+# Check logs
 docker logs knowledge-mcp --tail 30
 ```
 
-## Credentials Management
+## Credentials
 
-All API keys stored securely at `/root/.goldcoast_credentials` (chmod 600).
+Location: `/root/.goldcoast_credentials` (chmod 600)
+Load: `source /root/load_credentials.sh`
 
-### Loading Credentials
-```bash
-source /root/load_credentials.sh
-```
+| Category | Variables |
+|----------|-----------|
+| AI/LLM | OPENAI_API_KEY, ANTHROPIC_API_KEY, GROQ_API_KEY, GOOGLE_GEMINI_KEY, ELEVENLABS_API_KEY, ASSEMBLY_AI_KEY |
+| Domains | GODADDY_API_KEY, GODADDY_API_SECRET |
+| Automation | APIFY_TOKEN, INSTANTLY_API_KEY, KEEPA_API_KEY |
+| Google | GMAIL_CLIENT_ID, GOOGLE_CLOUD_CLIENT_ID |
+| Cal.com | CALCOM_LICENSE_KEY, CAL_API_KEY, CAL_SIGNATURE_TOKEN |
+| WhatsApp | META_WHATSAPP_TOKEN, META_USER_TOKEN |
+| CRM | TWENTY_CRM_API_KEY, ATLASSIAN_API_KEY |
+| Media | CLOUDINARY_KEY, CLOUDINARY_SECRET |
 
-### Available Credentials
-| Category | Variable | Service |
-|----------|----------|---------|
-| **AI/LLM** | OPENAI_API_KEY | OpenAI (embeddings, GPT) |
-| | ANTHROPIC_API_KEY | Claude API |
-| | GROQ_API_KEY | Groq (Llama models) |
-| | GOOGLE_GEMINI_KEY | Google Gemini 2.5 |
-| | ELEVENLABS_API_KEY | Voice synthesis |
-| | ASSEMBLY_AI_KEY | Transcription |
-| **Domains** | GODADDY_API_KEY | Domain availability |
-| **Automation** | APIFY_TOKEN | Web scraping |
-| | INSTANTLY_API_KEY | Cold email |
-| | KEEPA_API_KEY | Amazon price tracking |
-| **Google** | GMAIL_CLIENT_ID | Gmail API |
-| | GOOGLE_CLOUD_CLIENT_ID | Google Cloud |
-| **Cal.com** | CALCOM_LICENSE_KEY | Scheduling |
-| | CAL_API_KEY | |
-| **WhatsApp** | META_WHATSAPP_TOKEN | WhatsApp Business API |
-| **CRM** | TWENTY_CRM_API_KEY | Twenty CRM |
-| | ATLASSIAN_API_KEY | Jira/Confluence |
-| **Media** | CLOUDINARY_KEY | Image hosting |
-| **Internal** | WEBTOP_API_KEY | BookDepot API |
+## Key URLs
 
-## Webtop BookDepot API
-
-### Starting the API
-```bash
-docker exec -d webtop bash -c "cd /config && KEEPA_API_KEY=\$KEEPA_API_KEY /config/scraper-env/bin/python /config/bookdepot_api.py"
-```
-
-### API Files
-- `/config/bookdepot_api.py` - Flask API server
-- `/config/bookdepot_scraper.py` - BookDepot scraper
-- `/config/keepa_analyzer.py` - Keepa profit analyzer
-
-## GitHub Backup
-
-BookDepot analyzer: `https://github.com/cryptodominicano/bookdepot-analyzer`
-Knowledge MCP: `https://github.com/cryptodominicano/knowledge-mcp`
+| Service | URL |
+|---------|-----|
+| N8N | https://n8n.srv1175204.hstgr.cloud |
+| Cal.com | https://cal.srv1175204.hstgr.cloud |
+| Webtop | https://webtop.srv1175204.hstgr.cloud |
+| Botpress | https://botpress.srv1175204.hstgr.cloud |
 
 ## Key Paths
 
 | Item | Path |
 |------|------|
-| Credentials File | `/root/.goldcoast_credentials` |
-| Credentials Loader | `/root/load_credentials.sh` |
-| VPS Fix Scripts | `/root/vps-scripts/` |
-| Webtop Python | `/config/scraper-env/bin/python` |
+| Credentials | `/root/.goldcoast_credentials` |
+| Fix Scripts | `/root/vps-scripts/` |
+| BookDepot API | `/config/bookdepot_api.py` |
+| Scraper | `/config/bookdepot_scraper.py` |
+| Python Env | `/config/scraper-env/bin/python` |
+
+## GitHub Repos
+
+- https://github.com/cryptodominicano/knowledge-mcp
+- https://github.com/cryptodominicano/bookdepot-analyzer
