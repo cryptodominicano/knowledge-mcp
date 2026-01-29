@@ -2,7 +2,7 @@
 Generic Knowledge Base MCP Server
 Manages multiple Qdrant collections for different projects/domains
 + Remote command execution via webtop API
-+ N8N workflow automation
++ Self-healing: learns from web searches and stores solutions
 """
 
 import os
@@ -29,12 +29,100 @@ EMBEDDING_MODEL = "text-embedding-3-small"
 EMBEDDING_DIMENSIONS = 1536
 
 # Webtop API config
-WEBTOP_API_URL = os.environ.get("WEBTOP_API_URL", "http://webtop:5000")
-WEBTOP_API_KEY = os.environ.get("WEBTOP_API_KEY", "goldcoast2026")
+WEBTOP_API_URL = os.environ.get("WEBTOP_API_URL", "http://172.17.0.5:5000")
+WEBTOP_API_KEY = os.environ.get("EXEC_API_KEY", "goldcoast2026")
 
-# N8N API config
-N8N_API_KEY = os.environ.get("N8N_API_KEY", "")
-N8N_BASE_URL = os.environ.get("N8N_BASE_URL", "http://root-n8n-1:5678")
+# System context for troubleshooting with self-healing
+SYSTEM_INSTRUCTIONS = """
+=== GOLD COAST VPS TROUBLESHOOTING AGENT ===
+
+You are a self-healing infrastructure agent for Gold Coast AI Automations VPS.
+Your job is to diagnose issues, find solutions, and LEARN from each fix.
+
+=== TROUBLESHOOTING PROTOCOL (ALWAYS FOLLOW) ===
+
+STEP 1: SEARCH INTERNAL KNOWLEDGE FIRST
+- Call troubleshoot(issue) to search the gold_coast_infrastructure collection
+- If relevant solution found with score > 0.3, use it
+- Follow the SOPs returned (restart before recreate, one change at a time, etc.)
+
+STEP 2: IF NO INTERNAL SOLUTION FOUND
+- Use web_search to find solutions from trusted sources:
+  * GitHub Issues (docker, traefik, fastmcp, qdrant, n8n, botpress)
+  * Stack Overflow
+  * Official documentation (docs.docker.com, doc.traefik.io, qdrant.tech)
+  * FastMCP/MCP SDK issues and discussions
+- Search queries should include specific error messages and technology names
+
+STEP 3: SELF-HEALING - ADD NEW KNOWLEDGE
+After successfully resolving an issue using web search:
+- Call add_knowledge() to store the solution:
+  * collection: "gold_coast_infrastructure"
+  * title: Brief description (e.g., "Fix for Qdrant query_points migration")
+  * content: Full solution including:
+    - Problem description
+    - Root cause
+    - Solution/commands
+    - Source URL
+  * category: "fix" | "workaround" | "configuration" | "error_solution"
+  * source: "web_search"
+
+STEP 4: VERIFY THE FIX
+- After applying any fix, run diagnostic: bash /root/vps-scripts/diagnostic.sh
+- Test the specific functionality that was broken
+- If fix didn't work, continue searching and try next solution
+
+=== GOLDEN RULES (NEVER VIOLATE) ===
+
+1. RESTART before RECREATE - never suggest docker rm as first option
+2. ONE change at a time - test between each change
+3. Use docker-compose for webtop (shell escaping breaks Traefik labels)
+4. Check networks after ANY container change
+5. Restart BookDepot API after webtop changes
+6. Refresh Claude browser after MCP server changes
+7. ALWAYS add successful web-found solutions to knowledge base
+
+=== CONTAINER DEPENDENCIES ===
+
+Breaking one breaks others downstream:
+- knowledge-mcp -> Qdrant (172.17.0.2:6333) + Webtop API (172.17.0.5:5000)
+- N8N workflows -> webtop:5000 (BookDepot API)
+- webtop -> Python venv (/config/scraper-env) + API files
+- Claude.ai -> knowledge-mcp:8001 + botpress-mcp:8080
+
+=== QUICK REFERENCE ===
+
+VPS IP: 72.60.228.103
+Qdrant: 172.17.0.2:6333 (bridge network)
+Webtop: 172.17.0.5:5000 (API), :3000 (desktop)
+knowledge-mcp: port 8001
+botpress-mcp: port 8080
+EXEC_API_KEY: goldcoast2026
+
+=== TRUSTED SOURCES FOR WEB SEARCH ===
+
+When searching for solutions, prioritize these domains:
+- github.com (issues, discussions)
+- stackoverflow.com
+- docs.docker.com
+- doc.traefik.io
+- qdrant.tech/documentation
+- docs.n8n.io
+- botpress.com/docs
+
+=== EXAMPLE SELF-HEALING FLOW ===
+
+User: "I'm getting 'QdrantClient has no attribute search' error"
+
+1. Call troubleshoot("qdrant search attribute error")
+2. If no good match found, web_search("qdrant-client python search attribute error query_points migration")
+3. Find solution: "In qdrant-client 1.16+, use query_points() instead of search()"
+4. Apply fix
+5. Verify fix works
+6. Call add_knowledge() to store the solution for future use
+
+This way, the SAME problem will be solved instantly next time from internal knowledge!
+"""
 
 # Logging
 logging.basicConfig(
@@ -44,8 +132,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(f"{SERVICE_NAME}-mcp")
 
-# Initialize
-mcp = FastMCP(f"{SERVICE_NAME}-mcp")
+# Initialize MCP with instructions
+mcp = FastMCP(
+    f"{SERVICE_NAME}-mcp",
+    instructions=SYSTEM_INSTRUCTIONS
+)
 
 try:
     qdrant = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
@@ -71,234 +162,65 @@ def generate_embedding(text: str) -> Optional[List[float]]:
         return None
 
 
-def n8n_request(method: str, endpoint: str, data: dict = None) -> Dict[str, Any]:
-    """Make authenticated request to N8N API."""
-    if not N8N_API_KEY:
-        return {"error": "N8N_API_KEY not configured"}
-    
-    headers = {
-        "X-N8N-API-KEY": N8N_API_KEY,
-        "Content-Type": "application/json"
-    }
-    url = f"{N8N_BASE_URL}/api/v1{endpoint}"
-    
+def _internal_search(collection: str, query: str, limit: int = 3) -> List[Dict]:
+    """Internal search function (not a tool) for use by other functions."""
+    if not qdrant or not openai_client:
+        return []
     try:
-        if method.upper() == "GET":
-            response = httpx.get(url, headers=headers, timeout=30)
-        elif method.upper() == "POST":
-            response = httpx.post(url, headers=headers, json=data or {}, timeout=60)
-        elif method.upper() == "PUT":
-            response = httpx.put(url, headers=headers, json=data or {}, timeout=30)
-        elif method.upper() == "PATCH":
-            response = httpx.patch(url, headers=headers, json=data or {}, timeout=30)
-        elif method.upper() == "DELETE":
-            response = httpx.delete(url, headers=headers, timeout=30)
-        else:
-            return {"error": f"Unknown method: {method}"}
-        
-        if response.status_code >= 200 and response.status_code < 300:
-            return response.json() if response.text else {"success": True}
-        else:
-            return {"error": f"HTTP {response.status_code}", "detail": response.text[:500]}
+        query_embedding = generate_embedding(query)
+        if not query_embedding:
+            return []
+        results = qdrant.query_points(
+            collection_name=collection,
+            query=query_embedding,
+            limit=limit
+        )
+        return [
+            {
+                "title": r.payload.get("title", ""),
+                "content": r.payload.get("content", "")[:1000],
+                "score": round(r.score, 3)
+            }
+            for r in results.points
+        ]
     except Exception as e:
-        return {"error": str(e)}
-
-
-# =====================
-# N8N WORKFLOW TOOLS
-# =====================
-
-@mcp.tool()
-def n8n_list_workflows(limit: int = 50, active_only: bool = False) -> Dict[str, Any]:
-    """List all N8N workflows.
-    
-    Args:
-        limit: Maximum workflows to return (default: 50)
-        active_only: Only show active workflows
-    
-    Returns:
-        List of workflows with id, name, active status
-    """
-    result = n8n_request("GET", f"/workflows?limit={limit}")
-    if "error" in result:
-        return result
-    
-    workflows = result.get("data", [])
-    if active_only:
-        workflows = [w for w in workflows if w.get("active")]
-    
-    formatted = []
-    for w in workflows:
-        formatted.append({
-            "id": w.get("id"),
-            "name": w.get("name"),
-            "active": w.get("active"),
-            "updatedAt": w.get("updatedAt")
-        })
-    return {"workflows": formatted, "count": len(formatted)}
+        logger.error(f"Internal search failed: {e}")
+        return []
 
 
 @mcp.tool()
-def n8n_get_workflow(workflow_id: str) -> Dict[str, Any]:
-    """Get full workflow details including all nodes and connections.
+def troubleshoot(issue: str) -> Dict[str, Any]:
+    """
+    FIRST STEP for ANY VPS/infrastructure issue.
+    Searches knowledge base for relevant SOPs and returns guidance.
     
     Args:
-        workflow_id: The workflow ID
+        issue: Description of the problem (e.g., "gateway timeout", "mcp disconnected", "api not running")
     
     Returns:
-        Complete workflow JSON with nodes, connections, settings
+        Dict with SOPs, relevant docs, and recommended steps
     """
-    return n8n_request("GET", f"/workflows/{workflow_id}")
-
-
-@mcp.tool()
-def n8n_create_workflow(name: str, nodes: List[dict], connections: dict, active: bool = False) -> Dict[str, Any]:
-    """Create a new N8N workflow.
+    results = _internal_search("gold_coast_infrastructure", issue, limit=5)
     
-    Args:
-        name: Workflow name
-        nodes: List of node definitions
-        connections: Node connections object
-        active: Whether to activate immediately
+    # Check if we have a good match
+    has_good_match = any(r.get("score", 0) > 0.3 for r in results)
     
-    Returns:
-        Created workflow details
-    """
-    data = {
-        "name": name,
-        "nodes": nodes,
-        "connections": connections,
-        "active": active,
-        "settings": {"executionOrder": "v1"}
+    return {
+        "sop_reminder": """
+FOLLOW THESE RULES:
+1. Restart before recreate
+2. One change at a time  
+3. Use docker-compose for webtop
+4. Check networks after changes
+5. Restart API after webtop changes
+""",
+        "relevant_knowledge": results,
+        "has_good_match": has_good_match,
+        "diagnostic_command": "bash /root/vps-scripts/diagnostic.sh",
+        "next_step": "Use internal solution" if has_good_match else "Search web for solution, then add_knowledge() when fixed",
+        "self_healing_reminder": "If you find a solution via web search, ADD IT to gold_coast_infrastructure collection!"
     }
-    return n8n_request("POST", "/workflows", data)
 
-
-@mcp.tool()
-def n8n_update_workflow(workflow_id: str, updates: dict) -> Dict[str, Any]:
-    """Update an existing workflow.
-    
-    Args:
-        workflow_id: The workflow ID
-        updates: Dictionary of fields to update (name, nodes, connections, active, settings)
-    
-    Returns:
-        Updated workflow details
-    """
-    return n8n_request("PUT", f"/workflows/{workflow_id}", updates)
-
-
-@mcp.tool()
-def n8n_activate_workflow(workflow_id: str, active: bool = True) -> Dict[str, Any]:
-    """Activate or deactivate a workflow.
-    
-    Args:
-        workflow_id: The workflow ID
-        active: True to activate, False to deactivate
-    
-    Returns:
-        Updated workflow status
-    """
-    if active:
-        return n8n_request("POST", f"/workflows/{workflow_id}/activate")
-    else:
-        return n8n_request("POST", f"/workflows/{workflow_id}/deactivate")
-
-
-@mcp.tool()
-def n8n_delete_workflow(workflow_id: str, confirm: bool = False) -> Dict[str, Any]:
-    """Delete a workflow. Requires confirm=True.
-    
-    Args:
-        workflow_id: The workflow ID
-        confirm: Must be True to actually delete
-    
-    Returns:
-        Deletion result
-    """
-    if not confirm:
-        return {"warning": f"Will DELETE workflow {workflow_id}! Set confirm=True to proceed"}
-    return n8n_request("DELETE", f"/workflows/{workflow_id}")
-
-
-@mcp.tool()
-def n8n_execute_workflow(workflow_id: str, data: dict = None) -> Dict[str, Any]:
-    """Manually execute/trigger a workflow.
-    
-    Args:
-        workflow_id: The workflow ID
-        data: Optional input data to pass to the workflow
-    
-    Returns:
-        Execution result
-    """
-    return n8n_request("POST", f"/workflows/{workflow_id}/run", data or {})
-
-
-@mcp.tool()
-def n8n_list_executions(workflow_id: str = None, limit: int = 20, status: str = None) -> Dict[str, Any]:
-    """List workflow executions (run history).
-    
-    Args:
-        workflow_id: Filter by specific workflow (optional)
-        limit: Maximum results (default: 20)
-        status: Filter by status: success, error, waiting (optional)
-    
-    Returns:
-        List of executions with status and timing
-    """
-    params = f"?limit={limit}"
-    if workflow_id:
-        params += f"&workflowId={workflow_id}"
-    if status:
-        params += f"&status={status}"
-    
-    result = n8n_request("GET", f"/executions{params}")
-    if "error" in result:
-        return result
-    
-    executions = result.get("data", [])
-    formatted = []
-    for e in executions:
-        formatted.append({
-            "id": e.get("id"),
-            "workflowId": e.get("workflowId"),
-            "status": e.get("status"),
-            "startedAt": e.get("startedAt"),
-            "stoppedAt": e.get("stoppedAt"),
-            "finished": e.get("finished")
-        })
-    return {"executions": formatted, "count": len(formatted)}
-
-
-@mcp.tool()
-def n8n_get_execution(execution_id: str) -> Dict[str, Any]:
-    """Get detailed execution info including error messages.
-    
-    Args:
-        execution_id: The execution ID
-    
-    Returns:
-        Full execution details including node results and errors
-    """
-    return n8n_request("GET", f"/executions/{execution_id}")
-
-
-@mcp.tool()
-def n8n_test_connection() -> Dict[str, Any]:
-    """Test N8N API connection."""
-    if not N8N_API_KEY:
-        return {"status": "error", "message": "N8N_API_KEY not configured"}
-    
-    result = n8n_request("GET", "/workflows?limit=1")
-    if "error" in result:
-        return {"status": "error", "message": result.get("error")}
-    return {"status": "connected", "base_url": N8N_BASE_URL}
-
-
-# =====================
-# WEBTOP EXEC TOOLS
-# =====================
 
 @mcp.tool()
 def exec_command(cmd: str, timeout: int = 300) -> Dict[str, Any]:
@@ -341,10 +263,24 @@ def read_file(filepath: str) -> Dict[str, Any]:
     Returns:
         Dict with file contents or error
     """
-    result = exec_command(f"cat {filepath}")
-    if result.get("returncode") == 0:
-        return {"content": result.get("stdout", ""), "filepath": filepath}
-    return {"error": result.get("stderr") or result.get("error", "Unknown error")}
+    try:
+        response = httpx.post(
+            f"{WEBTOP_API_URL}/exec",
+            json={"cmd": f"cat {filepath}"},
+            headers={
+                "Content-Type": "application/json",
+                "X-API-Key": WEBTOP_API_KEY
+            },
+            timeout=60
+        )
+        if response.status_code == 200:
+            result = response.json()
+            if result.get("returncode") == 0:
+                return {"content": result.get("stdout", ""), "path": filepath}
+            return {"error": result.get("stderr", "Unknown error")}
+        return {"error": f"API returned {response.status_code}"}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @mcp.tool()
@@ -358,12 +294,26 @@ def write_file(filepath: str, content: str) -> Dict[str, Any]:
     Returns:
         Dict with success status or error
     """
-    # Escape content for shell
-    escaped = content.replace("'", "'\\''")
-    result = exec_command(f"cat > {filepath} << 'EOFMARKER'\n{content}\nEOFMARKER")
-    if result.get("returncode") == 0:
-        return {"success": True, "filepath": filepath}
-    return {"error": result.get("stderr") or result.get("error", "Unknown error")}
+    try:
+        escaped = content.replace("'", "'\\''")
+        cmd = f"cat > {filepath} << 'EOFWRITE'\n{content}\nEOFWRITE"
+        response = httpx.post(
+            f"{WEBTOP_API_URL}/exec",
+            json={"cmd": cmd},
+            headers={
+                "Content-Type": "application/json",
+                "X-API-Key": WEBTOP_API_KEY
+            },
+            timeout=60
+        )
+        if response.status_code == 200:
+            result = response.json()
+            if result.get("returncode") == 0:
+                return {"success": True, "path": filepath}
+            return {"error": result.get("stderr", "Unknown error")}
+        return {"error": f"API returned {response.status_code}"}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @mcp.tool()
@@ -376,15 +326,25 @@ def list_directory(path: str = "/config") -> Dict[str, Any]:
     Returns:
         Dict with directory listing or error
     """
-    result = exec_command(f"ls -la {path}")
-    if result.get("returncode") == 0:
-        return {"listing": result.get("stdout", ""), "path": path}
-    return {"error": result.get("stderr") or result.get("error", "Unknown error")}
+    try:
+        response = httpx.post(
+            f"{WEBTOP_API_URL}/exec",
+            json={"cmd": f"ls -la {path}"},
+            headers={
+                "Content-Type": "application/json",
+                "X-API-Key": WEBTOP_API_KEY
+            },
+            timeout=30
+        )
+        if response.status_code == 200:
+            result = response.json()
+            if result.get("returncode") == 0:
+                return {"listing": result.get("stdout", ""), "path": path}
+            return {"error": result.get("stderr", "Unknown error")}
+        return {"error": f"API returned {response.status_code}"}
+    except Exception as e:
+        return {"error": str(e)}
 
-
-# =====================
-# QDRANT KNOWLEDGE TOOLS
-# =====================
 
 @mcp.tool()
 def list_collections() -> Dict[str, Any]:
@@ -392,8 +352,9 @@ def list_collections() -> Dict[str, Any]:
     if not qdrant:
         return {"error": "Qdrant not connected"}
     try:
-        collections = qdrant.get_collections().collections
-        return {"collections": [c.name for c in collections]}
+        collections = qdrant.get_collections()
+        names = [c.name for c in collections.collections]
+        return {"collections": names, "count": len(names)}
     except Exception as e:
         return {"error": str(e)}
 
@@ -406,10 +367,9 @@ def get_collection_stats(collection: str) -> Dict[str, Any]:
     try:
         info = qdrant.get_collection(collection)
         return {
-            "name": collection,
+            "collection": collection,
             "points_count": info.points_count,
-            "vectors_count": info.vectors_count,
-            "status": info.status.value
+            "status": info.status.value if info.status else "unknown"
         }
     except Exception as e:
         return {"error": str(e)}
@@ -420,12 +380,16 @@ def create_collection(name: str) -> Dict[str, Any]:
     """Create a new Qdrant collection."""
     if not qdrant:
         return {"error": "Qdrant not connected"}
+    clean_name = name.lower().replace("-", "_").replace(" ", "_")
     try:
+        existing = [c.name for c in qdrant.get_collections().collections]
+        if clean_name in existing:
+            return {"error": f"Collection '{clean_name}' already exists"}
         qdrant.create_collection(
-            collection_name=name,
+            collection_name=clean_name,
             vectors_config=VectorParams(size=EMBEDDING_DIMENSIONS, distance=Distance.COSINE)
         )
-        return {"success": True, "collection": name}
+        return {"success": True, "collection": clean_name}
     except Exception as e:
         return {"error": str(e)}
 
@@ -452,7 +416,20 @@ def add_knowledge(
     category: str = "general",
     source: str = "conversation"
 ) -> Dict[str, Any]:
-    """Add knowledge to a collection with automatic embedding."""
+    """Add knowledge to a collection with automatic embedding.
+    
+    SELF-HEALING: Use this to store solutions found via web search!
+    
+    Args:
+        collection: Target collection (use "gold_coast_infrastructure" for VPS fixes)
+        title: Brief description of the solution
+        content: Full solution including problem, cause, fix, and source URL
+        category: One of: fix, workaround, configuration, error_solution, sop
+        source: Where it came from: conversation, web_search, documentation
+    
+    Returns:
+        Dict with success status and point_id
+    """
     if not qdrant:
         return {"error": "Qdrant not connected"}
     if not openai_client:
@@ -474,7 +451,8 @@ def add_knowledge(
             }
         )
         qdrant.upsert(collection_name=collection, points=[point])
-        return {"success": True, "point_id": point_id, "title": title}
+        logger.info(f"Self-healing: Added knowledge '{title}' from {source}")
+        return {"success": True, "point_id": point_id, "title": title, "message": "Knowledge stored for future use!"}
     except Exception as e:
         return {"error": str(e)}
 
@@ -490,18 +468,19 @@ def search_knowledge(collection: str, query: str, limit: int = 5) -> Dict[str, A
         query_embedding = generate_embedding(query)
         if not query_embedding:
             return {"error": "Failed to generate query embedding"}
-        results = qdrant.search(
+        results = qdrant.query_points(
             collection_name=collection,
-            query_vector=query_embedding,
+            query=query_embedding,
             limit=limit
         )
         formatted = []
-        for r in results:
+        for r in results.points:
             formatted.append({
                 "score": round(r.score, 4),
                 "title": r.payload.get("title", "Untitled"),
                 "content": r.payload.get("content", "")[:500],
                 "category": r.payload.get("category"),
+                "source": r.payload.get("source"),
                 "point_id": r.id
             })
         return {"results": formatted, "count": len(formatted)}
@@ -529,11 +508,9 @@ def test_connection(message: str) -> str:
     """Test MCP connection."""
     qdrant_status = "connected" if qdrant else "disconnected"
     openai_status = "configured" if openai_client else "missing"
-    n8n_status = "configured" if N8N_API_KEY else "missing"
-    return f"OK! {message} | Qdrant: {qdrant_status} | OpenAI: {openai_status} | N8N: {n8n_status}"
+    return f"OK! {message} | Qdrant: {qdrant_status} | OpenAI: {openai_status}"
 
 
 if __name__ == "__main__":
-    logger.info(f"Starting {SERVICE_NAME} MCP Server...")
-    logger.info(f"N8N configured: {bool(N8N_API_KEY)}")
+    logger.info(f"Starting {SERVICE_NAME} MCP Server with self-healing capabilities...")
     mcp.run(transport="sse", host="0.0.0.0", port=8000)
